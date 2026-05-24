@@ -34,7 +34,7 @@ def _read_learning_status(conn: Any) -> dict[str, Any]:
         cursor.execute(
             """
             SELECT id, ts, trigger, window_size, mode, status, evaluation_id,
-                   stage_before, stage_after, promoted
+                   stage_before, stage_after, promoted, apply_result, metrics
             FROM learning_runs
             ORDER BY ts DESC
             LIMIT 8
@@ -83,6 +83,8 @@ def _read_learning_status(conn: Any) -> dict[str, Any]:
 
 
 def _run_row(row: tuple[Any, ...]) -> dict[str, Any]:
+    apply_result = row[10] if len(row) > 10 and isinstance(row[10], dict) else {}
+    metrics = row[11] if len(row) > 11 and isinstance(row[11], dict) else {}
     return {
         "id": int(row[0]),
         "ts": row[1].isoformat()
@@ -96,6 +98,8 @@ def _run_row(row: tuple[Any, ...]) -> dict[str, Any]:
         "stage_before": str(row[7] or "BABY"),
         "stage_after": str(row[8] or "BABY"),
         "promoted": bool(row[9]),
+        "apply_result": _apply_result_summary(apply_result),
+        "metrics": _metrics_summary(metrics),
     }
 
 
@@ -123,6 +127,37 @@ def _param_row(row: tuple[Any, ...]) -> dict[str, Any]:
         "confirmation_candles": params.get("confirmation_candles"),
         "min_neutral_hours": params.get("min_neutral_hours"),
     }
+
+
+def _apply_result_summary(value: dict[str, Any]) -> dict[str, Any]:
+    accepted = value.get("accepted") if isinstance(value.get("accepted"), list) else []
+    return {
+        "version": int(value["version"]) if value.get("version") is not None else None,
+        "active": bool(value.get("active")),
+        "policy": str(value.get("policy") or ""),
+        "accepted_count": len(accepted),
+        "accepted_names": [str(item.get("name")) for item in accepted if isinstance(item, dict) and item.get("name")],
+    }
+
+
+def _metrics_summary(value: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "decision_count",
+        "trade_result_count",
+        "closed_trade_result_count",
+        "open_feedback_count",
+        "marked_pnl_latest",
+        "marked_pnl_change",
+        "realized_pnl_latest",
+        "unrealized_pnl_latest",
+        "open_position_count_latest",
+        "open_position_count_max",
+        "realized_pnl_total",
+        "win_rate",
+        "learning_review",
+        "rollback_result",
+    )
+    return {key: value.get(key) for key in keys if key in value}
 
 
 def _empty_payload(*, error: str | None = None) -> dict[str, Any]:

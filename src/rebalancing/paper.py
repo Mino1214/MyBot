@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -21,6 +22,19 @@ def paper_trading_enabled() -> bool:
 
 def paper_state_path() -> Path:
     return Path(os.environ.get("PAPER_STATE_PATH", ".state/paper_trading.json"))
+
+
+@dataclass(frozen=True)
+class _TradeCosts:
+    fee: float
+    slippage: float
+    liquidity: str
+    fee_rate: float
+    slippage_bps: float
+
+    @property
+    def total(self) -> float:
+        return self.fee + self.slippage
 
 
 def process_paper_alert(payload: Mapping[str, Any], *, path: Path | None = None) -> dict[str, Any]:
@@ -42,12 +56,14 @@ def process_paper_alert(payload: Mapping[str, Any], *, path: Path | None = None)
     target_symbols = {target.symbol for target in targets}
     target_prices = _prices(client, target_symbols - position_symbols)
     prices = {**position_prices, **target_prices}
+    funding_rates = _funding_rates(client, position_symbols | target_symbols)
 
     update = _rebalance_state(
         state=state,
         alert=alert,
         targets=targets,
         prices=prices,
+        funding_rates=funding_rates,
     )
     _write_state(state_path, update)
     record_paper_decision(
@@ -284,25 +300,168 @@ def _state_position_targets(state: Mapping[str, Any], *, scale: float = 1.0) -> 
     return tuple(targets)
 
 
+def _paper_position_exit_reasons(
+    positions: Any,
+    *,
+    now: datetime,
+) -> dict[str, str]:
+    take_profit = max(0.0, _env_float("PAPER_TAKE_PROFIT_PCT", 0.0))
+    stop_loss = abs(_env_float("PAPER_STOP_LOSS_PCT", 0.0))
+    max_minutes = _env_float("PAPER_MAX_POSITION_MINUTES", 0.0)
+    reasons: dict[str, str] = {}
+    for position in positions:
+        if not isinstance(position, Mapping):
+            continue
+        symbol = str(position.get("symbol") or "")
+        if not symbol:
+            continue
+        return_pct = _paper_position_return_pct(position)
+        if take_profit > 0 and return_pct is not None and return_pct >= take_profit:
+            reasons[symbol] = "take_profit"
+            continue
+        if stop_loss > 0 and return_pct is not None and return_pct <= -stop_loss:
+            reasons[symbol] = "stop_loss"
+            continue
+        if max_minutes > 0 and _paper_position_age_minutes(position, now=now) >= max_minutes:
+            reasons[symbol] = "max_position_minutes"
+    return reasons
+
+
+def _paper_position_return_pct(position: Mapping[str, Any]) -> float | None:
+    entry = _optional_positive(position.get("entry_price"))
+    price = _optional_positive(position.get("last_price"))
+    side = str(position.get("side") or "").upper()
+    if entry is None or price is None:
+        return None
+    if side == PositionSide.SHORT.value:
+        return 1.0 - price / entry
+    return price / entry - 1.0
+
+
+def _paper_position_age_minutes(position: Mapping[str, Any], *, now: datetime) -> float:
+    opened = _parse_datetime(str(position.get("opened_at") or ""))
+    if opened is None:
+        return 0.0
+    return max(0.0, (now - opened).total_seconds() / 60)
+
+
+def _accrue_funding(
+    state: dict[str, Any],
+    *,
+    now: datetime,
+    funding_rates: Mapping[str, float],
+) -> dict[str, Any]:
+    interval_hours = _env_float("PAPER_FUNDING_INTERVAL_HOURS", 8.0)
+    if interval_hours <= 0:
+        return state
+
+    realized = float(state.get("realized_pnl", 0.0))
+    funding_paid = float(state.get("funding_paid", 0.0))
+    events = list(state.get("funding_events", []))
+    positions: list[dict[str, Any]] = []
+    for raw in state.get("positions", []):
+        if not isinstance(raw, Mapping):
+            continue
+        position = dict(raw)
+        cost, last_funding_at = _position_funding_cost(
+            position,
+            now=now,
+            interval_hours=interval_hours,
+            funding_rates=funding_rates,
+        )
+        if last_funding_at is not None:
+            position["last_funding_at"] = last_funding_at.isoformat()
+        if abs(cost) > 1e-12:
+            symbol = str(position.get("symbol") or "")
+            realized -= cost
+            funding_paid += cost
+            position["funding_paid"] = float(position.get("funding_paid") or 0.0) + cost
+            events.append(
+                {
+                    "time": now.isoformat(),
+                    "symbol": symbol,
+                    "side": str(position.get("side") or ""),
+                    "rate": _paper_funding_rate(symbol, funding_rates),
+                    "funding": cost,
+                    "cost": cost,
+                }
+            )
+        positions.append(position)
+
+    return {
+        **state,
+        "realized_pnl": realized,
+        "funding_paid": funding_paid,
+        "funding_events": events[-_env_int("PAPER_FUNDING_HISTORY_LIMIT", 200) :],
+        "positions": positions,
+    }
+
+
+def _position_funding_cost(
+    position: Mapping[str, Any],
+    *,
+    now: datetime,
+    interval_hours: float,
+    funding_rates: Mapping[str, float],
+) -> tuple[float, datetime | None]:
+    symbol = str(position.get("symbol") or "")
+    side = str(position.get("side") or "").upper()
+    if not symbol or side not in {PositionSide.LONG.value, PositionSide.SHORT.value}:
+        return 0.0, None
+
+    last = _parse_datetime(str(position.get("last_funding_at") or position.get("opened_at") or ""))
+    if last is None:
+        return 0.0, now
+    if now <= last:
+        return 0.0, last
+
+    interval = timedelta(hours=interval_hours)
+    elapsed = int((now - last).total_seconds() // interval.total_seconds())
+    if elapsed <= 0:
+        return 0.0, last
+
+    price = _optional_positive(position.get("last_price")) or _optional_positive(position.get("entry_price"))
+    if price is None:
+        return 0.0, last + interval * elapsed
+    notional = _position_notional(position, price)
+    rate = _paper_funding_rate(symbol, funding_rates)
+    direction = 1.0 if side == PositionSide.LONG.value else -1.0
+    return notional * rate * elapsed * direction, last + interval * elapsed
+
+
+def _paper_funding_rate(symbol: str, funding_rates: Mapping[str, float]) -> float:
+    symbol_key = f"PAPER_FUNDING_RATE_{symbol.upper()}"
+    if os.environ.get(symbol_key) is not None:
+        return _env_float(symbol_key, 0.0)
+    if symbol in funding_rates:
+        return float(funding_rates[symbol])
+    return _env_float("PAPER_FUNDING_RATE", 0.0)
+
+
 def _rebalance_state(
     *,
     state: dict[str, Any],
     alert: TradingViewAlert,
     targets: tuple[TargetPosition, ...],
     prices: dict[str, float],
+    funding_rates: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     state = _mark_state(state, prices)
+    state = _accrue_funding(state, now=now, funding_rates=funding_rates or {})
     exposure_before = float(state.get("current_exposure", 0.0))
     realized = float(state.get("realized_pnl", 0.0))
     gross_realized = float(state.get("gross_realized_pnl", realized + _state_costs_paid(state)))
     fees_paid = float(state.get("fees_paid", 0.0))
     slippage_paid = float(state.get("slippage_paid", 0.0))
+    funding_paid = float(state.get("funding_paid", 0.0))
     turnover = float(state.get("turnover", _trades_turnover(state.get("trades", []))))
     positions = {item["symbol"]: dict(item) for item in state.get("positions", [])}
     position_count_before = len(positions)
-    target_by_symbol = {target.symbol: target for target in targets}
-    target_exposure = sum(target.notional for target in targets)
+    exit_reasons = _paper_position_exit_reasons(positions.values(), now=now)
+    effective_targets = tuple(target for target in targets if target.symbol not in exit_reasons)
+    target_by_symbol = {target.symbol: target for target in effective_targets}
+    target_exposure = sum(target.notional for target in effective_targets)
     min_order = _env_float("PAPER_MIN_ORDER_NOTIONAL", 10.0)
     orders: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = list(state.get("trades", []))
@@ -315,12 +474,12 @@ def _rebalance_state(
             continue
         notional = _position_notional(position, price)
         gross_pnl = _position_unrealized(position, price)
-        fee, slippage = _trade_costs(notional)
+        costs = _trade_costs(notional, liquidity=_paper_liquidity("exit"))
         gross_realized += gross_pnl
-        fees_paid += fee
-        slippage_paid += slippage
+        fees_paid += costs.fee
+        slippage_paid += costs.slippage
         turnover += notional
-        realized += gross_pnl - fee - slippage
+        realized += gross_pnl - costs.total
         if notional >= min_order:
             orders.append(
                 _paper_order(
@@ -329,9 +488,8 @@ def _rebalance_state(
                     position["side"],
                     notional,
                     True,
-                    "close_removed_target",
-                    fee=fee,
-                    slippage=slippage,
+                    exit_reasons.get(symbol, "close_removed_target"),
+                    costs=costs,
                 )
             )
             trades.append(
@@ -343,12 +501,12 @@ def _rebalance_state(
                     notional,
                     price,
                     gross_pnl=gross_pnl,
-                    fee=fee,
-                    slippage=slippage,
+                    costs=costs,
+                    funding=float(position.get("funding_paid") or 0.0),
                 )
             )
 
-    for target in targets:
+    for target in effective_targets:
         price = prices.get(target.symbol)
         if price is None:
             continue
@@ -357,12 +515,12 @@ def _rebalance_state(
         if current and current["side"] != target.side.value:
             notional = _position_notional(current, price)
             gross_pnl = _position_unrealized(current, price)
-            fee, slippage = _trade_costs(notional)
+            costs = _trade_costs(notional, liquidity=_paper_liquidity("exit"))
             gross_realized += gross_pnl
-            fees_paid += fee
-            slippage_paid += slippage
+            fees_paid += costs.fee
+            slippage_paid += costs.slippage
             turnover += notional
-            realized += gross_pnl - fee - slippage
+            realized += gross_pnl - costs.total
             if notional >= min_order:
                 orders.append(
                     _paper_order(
@@ -372,8 +530,7 @@ def _rebalance_state(
                         notional,
                         True,
                         "close_opposite_side",
-                        fee=fee,
-                        slippage=slippage,
+                        costs=costs,
                     )
                 )
                 trades.append(
@@ -385,8 +542,8 @@ def _rebalance_state(
                         notional,
                         price,
                         gross_pnl=gross_pnl,
-                        fee=fee,
-                        slippage=slippage,
+                        costs=costs,
+                        funding=float(current.get("funding_paid") or 0.0),
                     )
                 )
             current = None
@@ -395,11 +552,11 @@ def _rebalance_state(
         if current is None:
             if target.notional >= min_order:
                 quantity = target.notional / price
-                fee, slippage = _trade_costs(target.notional)
-                fees_paid += fee
-                slippage_paid += slippage
+                costs = _trade_costs(target.notional, liquidity=_paper_liquidity("entry"))
+                fees_paid += costs.fee
+                slippage_paid += costs.slippage
                 turnover += target.notional
-                realized -= fee + slippage
+                realized -= costs.total
                 positions[target.symbol] = _position(target.symbol, target.side.value, quantity, price)
                 orders.append(
                     _paper_order(
@@ -409,8 +566,7 @@ def _rebalance_state(
                         target.notional,
                         False,
                         "open_target",
-                        fee=fee,
-                        slippage=slippage,
+                        costs=costs,
                     )
                 )
                 trades.append(
@@ -421,8 +577,7 @@ def _rebalance_state(
                         target.side.value,
                         target.notional,
                         price,
-                        fee=fee,
-                        slippage=slippage,
+                        costs=costs,
                     )
                 )
             continue
@@ -441,11 +596,11 @@ def _rebalance_state(
                 float(current["entry_price"]) * old_quantity + price * add_quantity
             ) / new_quantity
             current["quantity"] = new_quantity
-            fee, slippage = _trade_costs(delta)
-            fees_paid += fee
-            slippage_paid += slippage
+            costs = _trade_costs(delta, liquidity=_paper_liquidity("rebalance"))
+            fees_paid += costs.fee
+            slippage_paid += costs.slippage
             turnover += delta
-            realized -= fee + slippage
+            realized -= costs.total
             orders.append(
                 _paper_order(
                     target.symbol,
@@ -454,8 +609,7 @@ def _rebalance_state(
                     delta,
                     False,
                     "increase_target",
-                    fee=fee,
-                    slippage=slippage,
+                    costs=costs,
                 )
             )
             trades.append(
@@ -466,8 +620,7 @@ def _rebalance_state(
                     target.side.value,
                     delta,
                     price,
-                    fee=fee,
-                    slippage=slippage,
+                    costs=costs,
                 )
             )
         else:
@@ -475,13 +628,15 @@ def _rebalance_state(
             reduce_quantity = reduce_notional / price
             fraction = min(1.0, reduce_quantity / float(current["quantity"]))
             gross_pnl = _position_unrealized(current, price) * fraction
-            fee, slippage = _trade_costs(reduce_notional)
+            funding = float(current.get("funding_paid") or 0.0) * fraction
+            costs = _trade_costs(reduce_notional, liquidity=_paper_liquidity("rebalance"))
             gross_realized += gross_pnl
-            fees_paid += fee
-            slippage_paid += slippage
+            fees_paid += costs.fee
+            slippage_paid += costs.slippage
             turnover += reduce_notional
-            realized += gross_pnl - fee - slippage
+            realized += gross_pnl - costs.total
             current["quantity"] = float(current["quantity"]) - reduce_quantity
+            current["funding_paid"] = float(current.get("funding_paid") or 0.0) - funding
             orders.append(
                 _paper_order(
                     target.symbol,
@@ -490,8 +645,7 @@ def _rebalance_state(
                     reduce_notional,
                     True,
                     "reduce_target",
-                    fee=fee,
-                    slippage=slippage,
+                    costs=costs,
                 )
             )
             trades.append(
@@ -503,8 +657,8 @@ def _rebalance_state(
                     reduce_notional,
                     price,
                     gross_pnl=gross_pnl,
-                    fee=fee,
-                    slippage=slippage,
+                    costs=costs,
+                    funding=funding,
                 )
             )
             if float(current["quantity"]) <= 1e-12:
@@ -520,10 +674,11 @@ def _rebalance_state(
         "gross_realized_pnl": gross_realized,
         "fees_paid": fees_paid,
         "slippage_paid": slippage_paid,
-        "trading_costs": fees_paid + slippage_paid,
+        "funding_paid": funding_paid,
+        "trading_costs": fees_paid + slippage_paid + funding_paid,
         "turnover": turnover,
         "positions": list(positions.values()),
-        "targets": [_target_payload(target) for target in targets],
+        "targets": [_target_payload(target) for target in effective_targets],
         "orders": orders,
         "trades": trades[-_env_int("PAPER_TRADE_HISTORY_LIMIT", 500) :],
         "last_signal": _signal_payload(alert),
@@ -558,7 +713,12 @@ def _mark_state(state: dict[str, Any], prices: dict[str, float]) -> dict[str, An
     realized = float(state.get("realized_pnl", 0.0))
     fees_paid = float(state.get("fees_paid", 0.0))
     slippage_paid = float(state.get("slippage_paid", 0.0))
-    trading_costs = fees_paid + slippage_paid if (fees_paid or slippage_paid) else _state_costs_paid(state)
+    funding_paid = float(state.get("funding_paid", 0.0))
+    trading_costs = (
+        fees_paid + slippage_paid + funding_paid
+        if (fees_paid or slippage_paid or funding_paid)
+        else _state_costs_paid(state)
+    )
     gross_realized = float(state.get("gross_realized_pnl", realized + trading_costs))
     turnover = float(state.get("turnover", _trades_turnover(state.get("trades", []))))
     positions = []
@@ -584,6 +744,7 @@ def _mark_state(state: dict[str, Any], prices: dict[str, float]) -> dict[str, An
         "gross_realized_pnl": gross_realized,
         "fees_paid": fees_paid,
         "slippage_paid": slippage_paid,
+        "funding_paid": funding_paid,
         "trading_costs": trading_costs,
         "turnover": turnover,
         "unrealized_pnl": unrealized,
@@ -620,6 +781,7 @@ def _state_payload(state: dict[str, Any]) -> dict[str, Any]:
         "total_pnl_pct": total_pnl_pct,
         "fees_paid": float(state.get("fees_paid", 0.0)),
         "slippage_paid": float(state.get("slippage_paid", 0.0)),
+        "funding_paid": float(state.get("funding_paid", 0.0)),
         "trading_costs": float(state.get("trading_costs", _state_costs_paid(state))),
         "turnover": float(state.get("turnover", _trades_turnover(state.get("trades", [])))),
         "current_exposure": float(state.get("current_exposure", 0.0)),
@@ -629,6 +791,7 @@ def _state_payload(state: dict[str, Any]) -> dict[str, Any]:
         "orders": list(state.get("orders", [])),
         "targets": list(state.get("targets", [])),
         "trades": list(reversed(state.get("trades", [])[-50:])),
+        "funding_events": list(reversed(state.get("funding_events", [])[-20:])),
         "last_rebalance": dict(state.get("last_rebalance") or {}),
         "latest_signal_id": last_signal.get("signal_id"),
         "events": _paper_events(state),
@@ -682,7 +845,18 @@ def _prices(client: BinanceFuturesClient, symbols: set[str]) -> dict[str, float]
     return prices
 
 
+def _funding_rates(client: BinanceFuturesClient, symbols: set[str]) -> dict[str, float]:
+    rates: dict[str, float] = {}
+    for symbol in symbols:
+        try:
+            rates[symbol] = client.funding_rate(symbol)
+        except Exception:
+            continue
+    return rates
+
+
 def _position(symbol: str, side: str, quantity: float, entry_price: float) -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
     return {
         "symbol": symbol,
         "side": side,
@@ -691,6 +865,9 @@ def _position(symbol: str, side: str, quantity: float, entry_price: float) -> di
         "last_price": entry_price,
         "notional": quantity * entry_price,
         "unrealized_pnl": 0.0,
+        "opened_at": now,
+        "last_funding_at": now,
+        "funding_paid": 0.0,
     }
 
 
@@ -706,17 +883,47 @@ def _position_unrealized(position: Mapping[str, Any], price: float) -> float:
     return quantity * (price - entry)
 
 
-def _trade_costs(notional: float) -> tuple[float, float]:
+def _trade_costs(notional: float, *, liquidity: str | None = None) -> _TradeCosts:
     absolute_notional = abs(notional)
-    fee_rate = max(0.0, _env_float("PAPER_FEE_RATE", 0.0004))
-    slippage_rate = max(0.0, _env_float("PAPER_SLIPPAGE_BPS", 0.0)) / 10_000
-    return absolute_notional * fee_rate, absolute_notional * slippage_rate
+    resolved = (liquidity or _paper_liquidity("default")).lower()
+    if resolved not in {"maker", "taker"}:
+        resolved = "taker"
+    fee_rate = _paper_fee_rate(resolved)
+    slippage_bps = _paper_slippage_bps(resolved)
+    slippage_rate = slippage_bps / 10_000
+    return _TradeCosts(
+        fee=absolute_notional * fee_rate,
+        slippage=absolute_notional * slippage_rate,
+        liquidity=resolved,
+        fee_rate=fee_rate,
+        slippage_bps=slippage_bps,
+    )
+
+
+def _paper_liquidity(kind: str) -> str:
+    specific = os.environ.get(f"PAPER_{kind.upper()}_LIQUIDITY")
+    value = (specific or os.environ.get("PAPER_DEFAULT_LIQUIDITY") or "taker").lower()
+    return value if value in {"maker", "taker"} else "taker"
+
+
+def _paper_fee_rate(liquidity: str) -> float:
+    legacy = _env_float("PAPER_FEE_RATE", 0.0004)
+    return max(0.0, _env_float(f"PAPER_{liquidity.upper()}_FEE_RATE", legacy))
+
+
+def _paper_slippage_bps(liquidity: str) -> float:
+    legacy = _env_float("PAPER_SLIPPAGE_BPS", 0.0)
+    return max(0.0, _env_float(f"PAPER_{liquidity.upper()}_SLIPPAGE_BPS", legacy))
 
 
 def _state_costs_paid(state: Mapping[str, Any]) -> float:
     if "trading_costs" in state:
         return float(state.get("trading_costs") or 0.0)
-    return float(state.get("fees_paid") or 0.0) + float(state.get("slippage_paid") or 0.0)
+    return (
+        float(state.get("fees_paid") or 0.0)
+        + float(state.get("slippage_paid") or 0.0)
+        + float(state.get("funding_paid") or 0.0)
+    )
 
 
 def _trades_turnover(trades: Any) -> float:
@@ -745,9 +952,9 @@ def _paper_order(
     reduce_only: bool,
     reason: str,
     *,
-    fee: float = 0.0,
-    slippage: float = 0.0,
+    costs: _TradeCosts | None = None,
 ) -> dict[str, Any]:
+    costs = costs or _trade_costs(notional)
     return {
         "symbol": symbol,
         "action": action,
@@ -756,9 +963,12 @@ def _paper_order(
         "order_type": "MARKET",
         "reduce_only": reduce_only,
         "reason": reason,
-        "fee": fee,
-        "slippage": slippage,
-        "cost": fee + slippage,
+        "liquidity": costs.liquidity,
+        "fee_rate": costs.fee_rate,
+        "slippage_bps": costs.slippage_bps,
+        "fee": costs.fee,
+        "slippage": costs.slippage,
+        "cost": costs.total,
     }
 
 
@@ -850,7 +1060,11 @@ def _order_symbols(orders: list[dict[str, Any]], prefix: str) -> list[str]:
         {
             str(order.get("symbol"))
             for order in orders
-            if order.get("symbol") and str(order.get("reason") or "").startswith(prefix)
+            if order.get("symbol")
+            and (
+                str(order.get("reason") or "").startswith(prefix)
+                or (prefix == "close" and _is_paper_exit_reason(str(order.get("reason") or "")))
+            )
         }
     )
 
@@ -859,18 +1073,22 @@ def _order_event_kind(order: Mapping[str, Any]) -> str:
     reason = str(order.get("reason") or "")
     if reason.startswith("open"):
         return "PAPER_ENTRY"
-    if reason.startswith("close"):
+    if reason.startswith("close") or _is_paper_exit_reason(reason):
         return "PAPER_EXIT"
     if reason.startswith(("increase", "reduce")):
         return "PAPER_REBALANCE"
     return "PAPER_ORDER"
 
 
+def _is_paper_exit_reason(reason: str) -> bool:
+    return reason in {"take_profit", "stop_loss", "max_position_minutes"}
+
+
 def _order_event_message(order: Mapping[str, Any]) -> str:
     reason = str(order.get("reason") or "")
     if reason.startswith("open"):
         label = "Entry"
-    elif reason.startswith("close"):
+    elif reason.startswith("close") or _is_paper_exit_reason(reason):
         label = "Exit"
     elif reason.startswith("increase"):
         label = "Increase"
@@ -893,10 +1111,11 @@ def _trade_event(
     price: float,
     *,
     gross_pnl: float = 0.0,
-    fee: float = 0.0,
-    slippage: float = 0.0,
+    costs: _TradeCosts | None = None,
+    funding: float = 0.0,
 ) -> dict[str, Any]:
-    cost = fee + slippage
+    costs = costs or _trade_costs(notional)
+    cost = costs.total + funding
     return {
         "time": now.isoformat(),
         "symbol": symbol,
@@ -905,8 +1124,12 @@ def _trade_event(
         "notional": notional,
         "price": price,
         "gross_pnl": gross_pnl,
-        "fee": fee,
-        "slippage": slippage,
+        "liquidity": costs.liquidity,
+        "fee_rate": costs.fee_rate,
+        "slippage_bps": costs.slippage_bps,
+        "fee": costs.fee,
+        "slippage": costs.slippage,
+        "funding": funding,
         "cost": cost,
         "net_pnl": gross_pnl - cost,
     }
@@ -921,6 +1144,9 @@ def _position_payload(position: Mapping[str, Any]) -> dict[str, Any]:
         "entry_price": float(position.get("entry_price", 0.0)),
         "mark_price": float(position.get("last_price", 0.0)),
         "unrealized_pnl": float(position.get("unrealized_pnl", 0.0)),
+        "funding_paid": float(position.get("funding_paid", 0.0)),
+        "opened_at": position.get("opened_at"),
+        "last_funding_at": position.get("last_funding_at"),
     }
 
 
@@ -1000,6 +1226,14 @@ def _parse_datetime(value: str) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _optional_positive(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _env_float(name: str, default: float) -> float:

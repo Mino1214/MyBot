@@ -10,7 +10,7 @@ from rebalancing.recording import _jsonb, _with_connection
 
 from .alerts import notify_learning_result
 from .diagnosis import load_recent_records, run_diagnosis, summarize_records
-from .params import apply_evaluation_suggestions
+from .params import activate_bot_params_version, apply_evaluation_suggestions, review_active_param_effects
 
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,10 @@ def run_learning_cycle(
     apply_policy: str | None = None,
 ) -> dict[str, Any]:
     stage_before = current_stage()
-    metrics = summarize_records(load_recent_records(window=window, mode=mode))
+    metrics = dict(summarize_records(load_recent_records(window=window, mode=mode)))
+    review = review_active_param_effects(metrics) or {}
+    if review:
+        metrics["learning_review"] = review
     result: dict[str, Any] = {
         "trigger": trigger,
         "window_size": int(window),
@@ -58,6 +61,26 @@ def run_learning_cycle(
     }
 
     try:
+        if review.get("rollback_recommended") is True and _auto_rollback_enabled():
+            target_version = review.get("rollback_target_version")
+            rollback = (
+                activate_bot_params_version(int(target_version))
+                if target_version is not None
+                else None
+            )
+            metrics["rollback_result"] = rollback or {}
+            result["apply_result"] = {
+                "policy": "rollback",
+                "version": rollback.get("version") if isinstance(rollback, Mapping) else None,
+                "active": bool(rollback.get("active")) if isinstance(rollback, Mapping) else False,
+                "accepted": [],
+                "review": review,
+            }
+            result["status"] = "rolled_back" if rollback else "rollback_failed"
+            _record_learning_run(result)
+            notify_learning_result(result)
+            return result
+
         diagnosis = run_diagnosis(window=window, mode=mode)
         if diagnosis is None:
             result["status"] = "diagnosis_failed"
@@ -216,3 +239,7 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except ValueError:
         return default
+
+
+def _auto_rollback_enabled() -> bool:
+    return os.environ.get("LEARNING_AUTO_ROLLBACK_ENABLED", "true").lower() == "true"

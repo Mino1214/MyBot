@@ -35,7 +35,17 @@
     <key>LEARNING_MODE</key>
     <string>paper</string>
     <key>LEARNING_PARAM_APPLY_POLICY</key>
-    <string>auto</string>
+    <string>approve</string>
+    <key>LEARNING_AUTO_ROLLBACK_ENABLED</key>
+    <string>true</string>
+    <key>LEARNING_REVIEW_MIN_CLOSED_TRADES</key>
+    <string>20</string>
+    <key>LEARNING_ROLLBACK_MARKED_PNL_DROP</key>
+    <string>5.0</string>
+    <key>LEARNING_ROLLBACK_REALIZED_PNL_DROP</key>
+    <string>2.0</string>
+    <key>LEARNING_ROLLBACK_WIN_RATE_DROP</key>
+    <string>0.15</string>
     <key>ENGINE_HOST</key>
     <string>127.0.0.1</string>
     <key>ENGINE_PORT</key>
@@ -71,11 +81,35 @@
     <key>PAPER_MIN_REBALANCE_MINUTES</key>
     <string>60</string>
     <key>PAPER_BLOCK_NEW_ENTRIES_LOSS_PCT</key>
-    <string>-1.0</string>
+    <string>-0.02</string>
     <key>PAPER_FEE_RATE</key>
     <string>0.0004</string>
     <key>PAPER_SLIPPAGE_BPS</key>
     <string>0</string>
+    <key>PAPER_MAKER_FEE_RATE</key>
+    <string>0.0002</string>
+    <key>PAPER_TAKER_FEE_RATE</key>
+    <string>0.0004</string>
+    <key>PAPER_MAKER_SLIPPAGE_BPS</key>
+    <string>0</string>
+    <key>PAPER_TAKER_SLIPPAGE_BPS</key>
+    <string>2</string>
+    <key>PAPER_ENTRY_LIQUIDITY</key>
+    <string>maker</string>
+    <key>PAPER_REBALANCE_LIQUIDITY</key>
+    <string>taker</string>
+    <key>PAPER_EXIT_LIQUIDITY</key>
+    <string>taker</string>
+    <key>PAPER_FUNDING_INTERVAL_HOURS</key>
+    <string>8</string>
+    <key>PAPER_FUNDING_RATE</key>
+    <string>0</string>
+    <key>PAPER_TAKE_PROFIT_PCT</key>
+    <string>0.025</string>
+    <key>PAPER_STOP_LOSS_PCT</key>
+    <string>0.015</string>
+    <key>PAPER_MAX_POSITION_MINUTES</key>
+    <string>180</string>
     <key>PAPER_TRADE_HISTORY_LIMIT</key>
     <string>500</string>
     <key>FALLBACK_EQUITY</key>

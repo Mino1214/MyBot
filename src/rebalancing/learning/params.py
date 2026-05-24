@@ -161,6 +161,18 @@ def activate_bot_params_version(version: int) -> dict[str, Any] | None:
         return None
 
 
+def review_active_param_effects(current_metrics: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        return _with_connection(lambda conn: _review_active_param_effects(conn, current_metrics)) or {
+            "status": "unavailable",
+            "rollback_recommended": False,
+            "reasons": ["database unavailable"],
+        }
+    except Exception as exc:
+        logger.warning("DB bot param review failed: %s", exc)
+        return {"status": "error", "rollback_recommended": False, "reasons": [str(exc)]}
+
+
 def _apply_evaluation_suggestions(conn: Any, evaluation_id: int, *, policy: str | None) -> dict[str, Any] | None:
     resolved_policy = _apply_policy(policy)
     activate = resolved_policy == "auto"
@@ -236,6 +248,155 @@ def _activate_version(conn: Any, version: int) -> dict[str, Any] | None:
     return {"bot_param_id": int(row[0]), "version": int(row[1]), "active": True}
 
 
+def _review_active_param_effects(conn: Any, current_metrics: Mapping[str, Any] | None) -> dict[str, Any]:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT version, created_at
+            FROM bot_params
+            WHERE active = true
+            ORDER BY version DESC
+            LIMIT 1
+            """
+        )
+        active = cursor.fetchone()
+        if active is None:
+            return {"status": "no_active_params", "rollback_recommended": False, "reasons": ["no active bot_params version"]}
+
+        active_version = int(active[0])
+        cursor.execute(
+            """
+            SELECT id, ts, metrics
+            FROM learning_runs
+            WHERE apply_result->>'version' = %s
+              AND apply_result->>'active' = 'true'
+            ORDER BY ts ASC
+            LIMIT 1
+            """,
+            (str(active_version),),
+        )
+        baseline = cursor.fetchone()
+        if baseline is None:
+            return {
+                "status": "no_activation_baseline",
+                "active_version": active_version,
+                "rollback_recommended": False,
+                "reasons": ["active version has no recorded activation run"],
+            }
+
+        if current_metrics is None:
+            cursor.execute(
+                """
+                SELECT id, ts, metrics
+                FROM learning_runs
+                WHERE metrics IS NOT NULL
+                ORDER BY ts DESC
+                LIMIT 1
+                """
+            )
+            latest = cursor.fetchone()
+            latest_metrics = latest[2] if latest is not None and isinstance(latest[2], Mapping) else {}
+            latest_run_id = int(latest[0]) if latest is not None else None
+            latest_ts = _iso(latest[1]) if latest is not None else None
+        else:
+            latest_metrics = dict(current_metrics)
+            latest_run_id = None
+            latest_ts = None
+
+        cursor.execute(
+            """
+            SELECT version
+            FROM bot_params
+            WHERE version < %s
+            ORDER BY version DESC
+            LIMIT 1
+            """,
+            (active_version,),
+        )
+        previous = cursor.fetchone()
+
+    return _param_effect_review(
+        active_version=active_version,
+        baseline_run_id=int(baseline[0]),
+        baseline_ts=_iso(baseline[1]),
+        baseline_metrics=baseline[2] if isinstance(baseline[2], Mapping) else {},
+        latest_run_id=latest_run_id,
+        latest_ts=latest_ts,
+        latest_metrics=latest_metrics,
+        rollback_target_version=int(previous[0]) if previous is not None else None,
+    )
+
+
+def _param_effect_review(
+    *,
+    active_version: int,
+    baseline_run_id: int,
+    baseline_ts: str | None,
+    baseline_metrics: Mapping[str, Any],
+    latest_run_id: int | None,
+    latest_ts: str | None,
+    latest_metrics: Mapping[str, Any],
+    rollback_target_version: int | None,
+) -> dict[str, Any]:
+    deltas = {
+        "marked_pnl_latest": _delta(latest_metrics, baseline_metrics, "marked_pnl_latest"),
+        "realized_pnl_total": _delta(latest_metrics, baseline_metrics, "realized_pnl_total"),
+        "win_rate": _delta(latest_metrics, baseline_metrics, "win_rate"),
+        "max_drawdown_pnl": _delta(latest_metrics, baseline_metrics, "max_drawdown_pnl"),
+    }
+    closed = _metric_int(latest_metrics, "closed_trade_result_count")
+    min_closed = _env_int("LEARNING_REVIEW_MIN_CLOSED_TRADES", 20)
+    reasons: list[str] = []
+
+    if closed < min_closed:
+        return {
+            "status": "insufficient_trade_data",
+            "active_version": active_version,
+            "rollback_target_version": rollback_target_version,
+            "baseline_run_id": baseline_run_id,
+            "baseline_ts": baseline_ts,
+            "latest_run_id": latest_run_id,
+            "latest_ts": latest_ts,
+            "closed_trade_result_count": closed,
+            "min_closed_trade_result_count": min_closed,
+            "deltas": deltas,
+            "rollback_recommended": False,
+            "reasons": [f"closed trades {closed} below review minimum {min_closed}"],
+        }
+
+    marked_drop = _env_float("LEARNING_ROLLBACK_MARKED_PNL_DROP", 5.0)
+    realized_drop = _env_float("LEARNING_ROLLBACK_REALIZED_PNL_DROP", 2.0)
+    win_rate_drop = _env_float("LEARNING_ROLLBACK_WIN_RATE_DROP", 0.15)
+
+    if _at_or_below(deltas["marked_pnl_latest"], -abs(marked_drop)):
+        reasons.append(f"marked PnL worsened by {deltas['marked_pnl_latest']:.4f}")
+    if _at_or_below(deltas["realized_pnl_total"], -abs(realized_drop)):
+        reasons.append(f"realized PnL worsened by {deltas['realized_pnl_total']:.4f}")
+    if _at_or_below(deltas["win_rate"], -abs(win_rate_drop)):
+        reasons.append(f"win rate worsened by {deltas['win_rate']:.4f}")
+
+    rollback_recommended = bool(reasons) and rollback_target_version is not None
+    if not reasons:
+        reasons.append("active params have not breached rollback thresholds")
+    elif rollback_target_version is None:
+        reasons.append("no earlier bot_params version is available")
+
+    return {
+        "status": "reviewed",
+        "active_version": active_version,
+        "rollback_target_version": rollback_target_version,
+        "baseline_run_id": baseline_run_id,
+        "baseline_ts": baseline_ts,
+        "latest_run_id": latest_run_id,
+        "latest_ts": latest_ts,
+        "closed_trade_result_count": closed,
+        "min_closed_trade_result_count": min_closed,
+        "deltas": deltas,
+        "rollback_recommended": rollback_recommended,
+        "reasons": reasons,
+    }
+
+
 def _read_active_params(conn: Any) -> dict[str, Any]:
     with conn.cursor() as cursor:
         return _read_active_params_from_cursor(cursor)
@@ -260,6 +421,48 @@ def _read_active_params_from_cursor(cursor: Any) -> dict[str, Any]:
 def _apply_policy(policy: str | None) -> str:
     value = (policy or os.environ.get("LEARNING_PARAM_APPLY_POLICY") or "approve").lower()
     return "auto" if value == "auto" else "approve"
+
+
+def _iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _delta(current: Mapping[str, Any], baseline: Mapping[str, Any], key: str) -> float | None:
+    current_value = _metric_float(current, key)
+    baseline_value = _metric_float(baseline, key)
+    if current_value is None or baseline_value is None:
+        return None
+    return round(current_value - baseline_value, 8)
+
+
+def _metric_float(metrics: Mapping[str, Any], key: str) -> float | None:
+    value = _numeric(metrics.get(key)) if isinstance(metrics, Mapping) else None
+    return float(value) if value is not None else None
+
+
+def _metric_int(metrics: Mapping[str, Any], key: str) -> int:
+    value = _metric_float(metrics, key)
+    return int(value) if value is not None else 0
+
+
+def _at_or_below(value: float | None, threshold: float) -> bool:
+    return value is not None and value <= threshold
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
 
 
 def _coerce_like(value: Any, default: Any) -> Any:

@@ -110,6 +110,13 @@ class BinanceFuturesClient:
         data = self._request("GET", "/fapi/v1/ticker/price", params={"symbol": symbol})
         return float(data["price"])
 
+    def premium_index(self, symbol: str) -> dict[str, Any]:
+        return self._request("GET", "/fapi/v1/premiumIndex", params={"symbol": symbol})
+
+    def funding_rate(self, symbol: str) -> float:
+        data = self.premium_index(symbol)
+        return float(data.get("lastFundingRate") or 0.0)
+
     def klines(self, symbol: str, interval: str, *, limit: int = 500) -> list[Candle]:
         data = self._request(
             "GET",

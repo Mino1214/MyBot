@@ -102,6 +102,7 @@ def build_diagnosis_prompt(window: int = 100, *, mode: str | None = None) -> str
         "window": window,
         "mode_filter": mode,
         "metrics": metrics,
+        "learning_review": learning_review(metrics),
         "current_bot_params": current_bot_params(),
         "recent_decisions": [_compact_record(record) for record in records[-recent_limit:]],
         "response_schema": DIAGNOSIS_SCHEMA_HINT,
@@ -109,6 +110,7 @@ def build_diagnosis_prompt(window: int = 100, *, mode: str | None = None) -> str
             "TradingView/Pine Script parameters must not be auto-applied.",
             "Only suggest bot-side EngineConfig parameters in param_suggestions.",
             "Prefer smaller, reversible changes and include evidence from the provided data.",
+            "Use learning_review to judge whether the previous active parameter version helped or should be rolled back.",
             "If data is insufficient, say so and avoid aggressive parameter suggestions.",
         ],
     }
@@ -326,6 +328,12 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     pnl_values = [_numeric(result.get("realized_pnl")) or 0.0 for result in closed_results]
     wins = sum(1 for value in pnl_values if value > 0)
     losses = sum(1 for value in pnl_values if value < 0)
+    marked_pnl_values = [
+        value
+        for value in (_account_numeric(record, "total_pnl") for record in records)
+        if value is not None
+    ]
+    position_counts = [_position_count(record) for record in records]
 
     return {
         "decision_count": len(records),
@@ -341,6 +349,17 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "loss_count": losses,
         "win_rate": round(wins / len(pnl_values), 6) if pnl_values else None,
         "max_drawdown_pnl": round(_max_drawdown(pnl_values), 8),
+        "open_feedback_count": len(marked_pnl_values),
+        "marked_pnl_latest": round(marked_pnl_values[-1], 8) if marked_pnl_values else None,
+        "marked_pnl_change": round(marked_pnl_values[-1] - marked_pnl_values[0], 8)
+        if len(marked_pnl_values) >= 2
+        else None,
+        "marked_pnl_min": round(min(marked_pnl_values), 8) if marked_pnl_values else None,
+        "marked_pnl_max": round(max(marked_pnl_values), 8) if marked_pnl_values else None,
+        "realized_pnl_latest": _latest_account_metric(records, "realized_pnl"),
+        "unrealized_pnl_latest": _latest_account_metric(records, "unrealized_pnl"),
+        "open_position_count_latest": position_counts[-1] if position_counts else 0,
+        "open_position_count_max": max(position_counts) if position_counts else 0,
         "regime_performance": _performance_by(records, "regime"),
         "market_bias_performance": _performance_by(records, "market_bias"),
         "btc_dominance_performance": _btc_dominance_performance(records),
@@ -356,6 +375,16 @@ def current_bot_params() -> dict[str, Any]:
     except Exception as exc:
         logger.warning("Active bot params unavailable for diagnosis prompt: %s", exc)
         return asdict(EngineConfig())
+
+
+def learning_review(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        from rebalancing.learning.params import review_active_param_effects
+
+        return review_active_param_effects(metrics)
+    except Exception as exc:
+        logger.warning("Learning review unavailable for diagnosis prompt: %s", exc)
+        return {"status": "unavailable", "rollback_recommended": False, "reasons": [str(exc)]}
 
 
 def _insert_evaluation(
@@ -432,6 +461,10 @@ def _compact_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "risk_action": record.get("risk_action"),
         "reasons": record.get("reasons"),
         "equity": account.get("equity"),
+        "realized_pnl": account.get("realized_pnl"),
+        "unrealized_pnl": account.get("unrealized_pnl"),
+        "total_pnl": account.get("total_pnl"),
+        "leverage": account.get("leverage"),
         "position_count": len(positions),
         "candidate_count": len(candidates),
         "market_internals": _compact_market_internals(record.get("market_internals")),
@@ -505,6 +538,24 @@ def _record_realized_pnl(record: Mapping[str, Any]) -> float:
             continue
         total += _numeric(result.get("realized_pnl")) or 0.0
     return total
+
+
+def _latest_account_metric(records: Sequence[Mapping[str, Any]], key: str) -> float | None:
+    for record in reversed(records):
+        value = _account_numeric(record, key)
+        if value is not None:
+            return round(value, 8)
+    return None
+
+
+def _account_numeric(record: Mapping[str, Any], key: str) -> float | None:
+    account = record.get("account") if isinstance(record.get("account"), Mapping) else {}
+    return _numeric(account.get(key))
+
+
+def _position_count(record: Mapping[str, Any]) -> int:
+    positions = record.get("positions")
+    return len(positions) if isinstance(positions, list) else 0
 
 
 def _btc_dominance_bucket(record: Mapping[str, Any]) -> str:

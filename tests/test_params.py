@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from rebalancing.learning.params import (
@@ -8,6 +9,7 @@ from rebalancing.learning.params import (
     apply_evaluation_suggestions,
     engine_config_from_params,
     prepare_param_update,
+    review_active_param_effects,
 )
 
 
@@ -87,6 +89,42 @@ class ParamTuningTest(unittest.TestCase):
         self.assertEqual(result, {"bot_param_id": 11, "version": 4, "active": True})
         self.assertTrue(any("UPDATE bot_params SET active = false" in statement for statement in connection.cursor_obj.statements))
         self.assertTrue(any("UPDATE bot_params SET active = true" in statement for statement in connection.cursor_obj.statements))
+
+    def test_review_active_param_effects_recommends_rollback_on_worse_metrics(self) -> None:
+        now = datetime(2026, 5, 24, tzinfo=timezone.utc)
+        connection = _FakeConnection(
+            fetches=[
+                (3, now),
+                (
+                    20,
+                    now,
+                    {
+                        "closed_trade_result_count": 30,
+                        "marked_pnl_latest": 0.0,
+                        "realized_pnl_total": 1.0,
+                        "win_rate": 0.55,
+                        "max_drawdown_pnl": -1.0,
+                    },
+                ),
+                (2,),
+            ]
+        )
+
+        with patch("rebalancing.learning.params._with_connection", side_effect=lambda write: write(connection)):
+            review = review_active_param_effects(
+                {
+                    "closed_trade_result_count": 30,
+                    "marked_pnl_latest": -8.0,
+                    "realized_pnl_total": -2.0,
+                    "win_rate": 0.30,
+                    "max_drawdown_pnl": -4.0,
+                }
+            )
+
+        self.assertTrue(review["rollback_recommended"])
+        self.assertEqual(review["active_version"], 3)
+        self.assertEqual(review["rollback_target_version"], 2)
+        self.assertLess(review["deltas"]["marked_pnl_latest"], 0)
 
 
 class _FakeConnection:
